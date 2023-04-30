@@ -1,0 +1,897 @@
+
+diff --git a/NEWS b/NEWS
+index b4d02ba..eeb053b 100644
+--- a/NEWS
++++ b/NEWS
+@@ -20,6 +20,9 @@
+ * Absent 'member since' dates are not treated as broken group history
+   any more.
+ 
++* Controls to modify some Git repository settings are added on a new page
++  /git/admin/index.php.
++
+ * Bug fixes:
+ 
+ ** In frontend/php/forum/forum.php, one argument of SQL query
+diff --git a/backend/extra/git/sv_cgit.pl.in b/backend/extra/git/sv_cgit.pl.in
+index a1127c6..01306a6 100644
+--- a/backend/extra/git/sv_cgit.pl.in
++++ b/backend/extra/git/sv_cgit.pl.in
+@@ -82,18 +82,59 @@ sub htmlspecialchars
+   return $_;
+ }
+ 
+-sub urldecode
++my %group_names;
++my %group_ids;
++
++sub get_group_id
++{
++  my $group = shift;
++  my $group_id;
++  $group =~ s,/.*,,;
++  return 0 unless exists $group_ids{$group};
++  $group_id = $group_ids{$group};
++}
++
++sub get_repo_name
++{
++  my $name = $_[0];
++  $name =~ s/[.]git$//;
++  return $name;
++}
++
++sub fetch_group_git_pref
++{
++  my ($pref, $group_id, $fallback) = @_;
++  return $fallback unless $group_id;
++  my @req = GetDBLists (
++    "group_preferences",
++    "group_id = $group_id AND preference_name = 'vcs:git:$pref'",
++    "preference_value"
++  );
++  foreach my $line (@req)
++    {
++      my ($val) = @{$line};
++      return $val;
++    }
++  return $fallback;
++}
++
++sub get_repo_order
++{
++  my $group_id = shift;
++  return split (":", fetch_group_git_pref ("repo-order", $group_id, ""));
++}
++
++sub fetch_repo_pref
+ {
+-  my $url = $_[0];
+-  $url =~ tr/+/ /;
+-  $url =~ s/%([a-fA-F0-9]{2})/chr(hex($1))/eg;
+-  return $url;
++  my ($pref, $repo_name, $group_id, $fallback) = @_;;
++  return fetch_group_git_pref ("$pref:$repo_name", $group_id, $fallback);
+ }
+ 
+ sub get_desc
+ {
+-  my $path = $_[0];
+-  my $desc = '';
++  my ($path, $url, $repo_name, $group_id) = @_;
++  my $desc = fetch_repo_pref ("desc", $repo_name, $group_id, "");
++  return $desc unless $desc eq "";
+   open (DESC, "<:encoding(UTF-8)", "$path/description") or warn "$path/description: $!";
+   $desc = <DESC>;
+   close (DESC);
+@@ -103,9 +144,7 @@ sub get_desc
+   return $desc;
+ }
+ 
+-my %group_names;
+-
+-sub output_group_name
++sub output_section
+ {
+   my $out = shift;
+   my $group = shift;
+@@ -124,36 +163,84 @@ sub output_group_name
+   return 1;
+ }
+ 
+-sub output_entry
++sub repo_entry
+ {
+-  my $dsc = get_desc ($_[2]);
+-  print { $_[0] } "repo.url=$_[1]\nrepo.path=$pfx/$_[1]\nrepo.desc=$dsc\n"
+-    . "repo.readme=README.html\nrepo.owner=\n";
++  my ($url, $desc_path) = @_;
++  my $repo_name = get_repo_name ($url);
++  my $group_id = get_group_id ($repo_name);
++  my $dsc = get_desc ($desc_path, $url, $repo_name, $group_id);
++  my $no_tarballs = fetch_repo_pref ("no-tarball", $repo_name, $group_id, 0);
++  my $readme = fetch_repo_pref ("readme", $repo_name, $group_id, "");
++  my $out = "repo.url=$url\nrepo.path=$pfx/$url\nrepo.desc=$dsc\n";
++  $out .= "repo.readme=$readme\n" unless $readme eq "";
++  $out .= "repo.snapshots=\n" if $no_tarballs;
++  return $out;
+ }
+ 
+ sub enumerate_subrepos
+ {
+-  my $out = shift;
+   my $group = shift;
++  my $names = shift;
++  my @ret;
+ 
+-  return unless -d $group;
++  return () unless -d $group;
+   chdir ($group) or die $!;
+   foreach my $repo (<*.git>)
+     {
+       next if ! -d $repo;
+-      output_entry ($out, "$group/$repo", $repo);
++      push @{$names}, get_repo_name ("$group/$repo");
++      push @ret, (repo_entry ("$group/$repo", $repo));
+     }
+   chdir ("..");
++  return @ret;
++}
++
++sub sort_entries
++{
++  my ($ent_ref, $name_ref, $group_id) = @_;
++  my @repo_order = get_repo_order ($group_id);
++  return @{$ent_ref} unless 1 < $#repo_order;
++  my @sorted;
++  my %by_name;
++  foreach my $n (@{$name_ref})
++    {
++      $by_name{$n} = shift @{$ent_ref};
++    }
++  foreach my $n (@repo_order)
++    {
++      next unless exists $by_name{$n};
++      push @sorted, $by_name{$n};
++      delete $by_name{$n};
++    }
++  foreach my $n (@{$name_ref})
++    {
++      next unless exists $by_name{$n};
++      push @sorted, $by_name{$n};
++    }
++  return @sorted;
++}
++
++sub sort_and_output_entries
++{
++  my ($ent_ref, $name_ref, $group, $out) = @_;
++  my $group_id = get_group_id ($group);
++  my @sorted = sort_entries ($ent_ref, $name_ref, $group_id);
++  foreach my $ent (@sorted)
++    {
++      print { $out } $ent;
++    }
+ }
+ 
+ my @db = GetDBLists (
+-  "groups", "status = 'A' AND use_git = 1", "unix_group_name, group_name"
++  "groups", "status = 'A' AND use_git = 1",
++  "unix_group_name, group_name, group_id"
+ );
+ 
+ foreach my $line (@db)
+   {
+-    my ($unix_group_name, $group_name) = @{$line};
++    my ($unix_group_name, $group_name, $group_id) = @{$line};
+     $group_names{$unix_group_name} = $group_name;
++    $group_ids{$unix_group_name} = $group_id;
+   }
+ 
+ my $out;
+@@ -166,10 +253,14 @@ foreach my $path (<*.git>)
+   {
+     next if ! -d $path;
+     my $group = $path;
++    my @entries;
++    my @names;
+     $group =~ s/[.]git$//;
+-    next unless output_group_name ($out, $group);
+-    output_entry ($out, $path, $path);
+-    enumerate_subrepos ($out, $group);
++    next unless output_section ($out, $group);
++    push @names, get_repo_name ($path);
++    push @entries, (repo_entry ($path, $path));
++    push @entries, enumerate_subrepos ($group, \@names);
++    sort_and_output_entries (\@entries, \@names, $group, $out);
+   }
+ chmod 0644, $out;
+ close ($out);
+diff --git a/frontend/php/git/admin/index.php b/frontend/php/git/admin/index.php
+new file mode 100644
+index 0000000..14ead80
+--- /dev/null
++++ b/frontend/php/git/admin/index.php
+@@ -0,0 +1,275 @@
++<?php
++# Configure Git repositories.
++#
++# Copyright (C) 1999, 2000 The SourceForge Crew
++# Copyright (C) 2000-2006 Mathieu Roy <yeupou--gnu.org>
++# Copyright (C) 2014, 2016, 2017 Assaf Gordon
++# Copyright (C) 2001-2011, 2013, 2017 Sylvain Beucler
++# Copyright (C) 2013, 2014, 2017-2023 Ineiev
++#
++# This file is part of Savane.
++#
++# Code written before 2008-03-30 (commit 8b757b2565ff) is distributed
++# under the terms of the GNU General Public license version 3 or (at your
++# option) any later version; further contributions are covered by
++# the GNU Affero General Public license version 3 or (at your option)
++# any later version.  The license notices for the AGPL and the GPL follow.
++#
++# Savane is free software: you can redistribute it and/or modify
++# it under the terms of the GNU Affero General Public License as
++# published by the Free Software Foundation, either version 3 of the
++# License, or (at your option) any later version.
++#
++# Savane is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU Affero General Public License for more details.
++#
++# You should have received a copy of the GNU Affero General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++#
++# Savane is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as
++# published by the Free Software Foundation, either version 3 of the
++# License, or (at your option) any later version.
++#
++# Savane is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++require_once ('../../include/init.php');
++require_once ('../../include/sane.php');
++require_once ('../../include/vcs.php');
++require_once ('../../include/form.php');
++
++$vcs = 'git';
++
++$res_grp = group_get_result ($group_id);
++
++if (db_numrows ($res_grp) < 1)
++  exit_error (_("Invalid Group"));
++
++session_require (['group' => $group_id, 'admin_flags' => 'A']);
++$functions = ['up', 'down'];
++$repos = vcs_get_repos ($vcs, $group_id);
++$desc = $readme = [];
++$submit_tarballs = ['submit'];
++$n = count ($repos);
++for ($i = 0; $i < $n; $i++)
++  {
++    $desc[] = "desc$i";
++    $readme[] = "readme$i";
++    $submit_tarballs[] = "disable_tarballs$i";
++  }
++
++extract (sane_import ('get',
++  ['strings' => [['func', $functions]], 'path' => ['name']]
++));
++extract (sane_import ('post', ['digits' => ['repo_no'], 'true' => ['submit']]));
++if (isset ($submit))
++  {
++    if (empty ($repo_no))
++      $repo_no = 0;
++    extract (sane_import ('post',
++      [
++        'specialchars' => ["desc$repo_no"],
++        'path' => ["readme$repo_no"],
++        'true' => ["disable_tarballs$repo_no"]
++      ]
++    ));
++    if (empty (${"disable_tarballs$repo_no"}))
++      $disable_tarballs = 0;
++    else
++      $disable_tarballs = 1;
++    $desc = ${"desc$repo_no"};
++    $readme = ${"readme$repo_no"};
++    if ($readme === null)
++      $readme = '';
++  }
++function page_start ()
++{
++  global $group_id, $vcs;
++  site_project_header (['group' => $group_id, 'context' => $vcs]);
++}
++function permute_repos ($i, $j, $n, &$repos)
++{
++  if ($j < 0)
++    {
++      $t = array_shift ($repos);
++      array_push ($repos, $t);
++      return;
++    }
++  if ($j >= $n)
++    {
++      $t = array_pop ($repos);
++      array_unshift ($repos, $t);
++      return;
++    }
++  $t = $repos[$i];
++  $repos[$i] = $repos[$j];
++  $repos[$j] = $t;
++}
++
++function func_move ($name, $inc)
++{
++  global $group_id, $repos, $vcs;
++  $n = count ($repos);
++  if ($n < 2)
++    return;
++  for ($i = 0; $i < $n && $repos[$i]['name'] !== $name; $i++)
++    ; # Empty cycle body.
++  if ($i == $n)
++    return; # This shouldn't happen, asserted in check_name ().
++  permute_repos ($i, $i + $inc, $n, $repos);
++  vcs_save_sorting ($vcs, $group_id, $repos);
++}
++
++function func_up ($name)
++{
++  func_move ($name, -1);
++}
++
++function func_down ($name)
++{
++  func_move ($name, 1);
++}
++
++function repo_html_id ($name)
++{
++  global $group_id, $group_name;
++  $group = project_get_object ($group_id);
++  $group_name = $group->getUnixName ();
++  return "repo-" . preg_replace (":^$group_name/?:", "", $name);
++}
++
++function check_name ()
++{
++  global $name, $repos;
++  if (empty ($name))
++    return false;
++
++  foreach ($repos as $r)
++    if ($r['name'] === $name)
++      return true;
++  page_start ();
++  exit_error (sprintf (_("Repository %s not found"), $name));
++  return false;
++}
++
++$id = repo_html_id ($name);
++$next_location = "Location: $php_self?group=$group_name#$id";
++
++$have_name = check_name ();
++if (isset ($func) && $have_name)
++  {
++    $f = "func_$func";
++    $f ($name);
++    header ($next_location);
++  }
++
++if (isset ($submit) && $have_name)
++  {
++    foreach (
++      ['desc' => $desc, 'readme' => $readme, 'no-tarball' => $disable_tarballs]
++      as $k => $v
++    )
++      if (isset ($v))
++        vcs_set_repo_pref ($vcs, $group_id, $k, $name, $v);
++    $repos = vcs_get_repos ($vcs, $group_id);
++  }
++
++function display_introduction ()
++{
++  print "<p>";
++  print _("On this page, group administrators can configure some settings of "
++   . "their repositories.");
++  print "</p>\n";
++}
++
++function show_repo_title ($r)
++{
++  global $php_self, $group_id, $repos, $group_name, $anchor, $name;
++  $url_base = "$php_self?group=$group_name&amp;name=$name&amp;func=";
++  print "<h2 id='$anchor'>$name</h2>\n";
++  if (count ($repos) < 2)
++    return;
++  print "<p>";
++  print "<a href=\"${url_base}up#$anchor\">" . _("Move up") . "</a>";
++  print " &nbsp; ";
++  print "<a href=\"${url_base}down#$anchor\">" . _("Move down") . "</a>";
++  print "</p>";
++}
++
++function show_edit ($name, $label, $val, $repo_no)
++{
++  $id = "$name$repo_no";
++  print "<p><span class='preinput'>"
++    . "<label for='$id'>$label</label></span> &nbsp; &nbsp;\n";
++  print form_input ("text", "$id", $val, 'size="34" maxlength="102"');
++  print "</p>\n";
++}
++
++
++function show_disable_tarballs ($repo_no)
++{
++  global $group_id, $name, $vcs;
++  $no_tarball = vcs_tarballs_disabled ($vcs, $group_id, $name);
++  $cb_name = "disable_tarballs$repo_no";
++  print "<p>";
++  print form_checkbox ($cb_name, $no_tarball) . "\n";
++  print "<label for='$cb_name'>" . _("Disable tarballs") . "</label>";
++  print "</p>\n";
++}
++
++function show_repo ($r, $repo_no)
++{
++  global $group_name, $anchor, $group_id, $name, $vcs, $i;
++  $name = $r['name'];
++  $readme = vcs_get_repo_readme ($vcs, $group_id, $name);
++  $anchor = repo_html_id ($name);
++  $suff = "?group=$group_name&amp;name=$name#$anchor";
++  $form_tag = form_tag ([], $suff);
++  show_repo_title ($r);
++  print $form_tag;
++  show_edit (
++    "desc", _("Description:"), utils_specialchars_decode ($r['desc']),
++    $repo_no
++  );
++  print "<h3>" . _("Web browsing settings") . "</h3>\n\n";
++  show_edit ("readme", _("README file:"), $readme, $repo_no);
++  show_disable_tarballs ($repo_no);
++  print form_hidden (['repo_no' => $repo_no]);
++  print '<p>';
++  print form_input (
++    'submit', "submit", _("Update"), 'class="' . utils_altrow ($repo_no) . '"'
++  );
++  if (!($repo_no % 2))
++    print "<br /> &nbsp;\n";
++  print "</p>\n";
++  print "</form>\n";
++}
++
++function display_repos ($repos)
++{
++  global $repo_no;
++  $repo_no = 0;
++  if (empty ($repos))
++    return;
++  foreach ($repos as $r)
++    {
++      print '<div class="' . utils_altrow ($repo_no) . "\">\n";
++      show_repo ($r, $repo_no);
++      print "</div>\n";
++      $repo_no++;
++    }
++}
++
++page_start ();
++display_introduction ();
++display_repos ($repos);
++$HTML->footer ([]);
++?>
+diff --git a/frontend/php/include/group.php b/frontend/php/include/group.php
+index 9bae179..5584dd3 100644
+--- a/frontend/php/include/group.php
++++ b/frontend/php/include/group.php
+@@ -398,7 +398,7 @@ class Group extends savane_error
+ 
+   function get_vcs_admin_url ($vcs)
+   {
+-    if ($vcs != 'cvs')
++    if (!in_array ($vcs, ['cvs', 'git']))
+       return null;
+     return preg_replace (',.*/,', '$0admin/', $this->getArtifactUrl ($vcs));
+   }
+diff --git a/frontend/php/include/pagemenu.php b/frontend/php/include/pagemenu.php
+index 9a35c44..9fda4df 100644
+--- a/frontend/php/include/pagemenu.php
++++ b/frontend/php/include/pagemenu.php
+@@ -341,7 +341,7 @@ function pagemenu_vcs_browse_entry ($group, $vcs, $name)
+   $repos = vcs_get_repos ($vcs, $group_id);
+   $n = count ($repos);
+   $scm_url = $group->getUrl ($a_idx);
+-  if (count ($repos) < 2)
++  if ($n < 2)
+     {
+       $title = sprintf (_("Browse %s repository"), $name);
+       return pagemenu_submenu_entry ($title, $scm_url);
+diff --git a/frontend/php/include/sane.php b/frontend/php/include/sane.php
+index e80091b..65abeb4 100644
+--- a/frontend/php/include/sane.php
++++ b/frontend/php/include/sane.php
+@@ -246,6 +246,13 @@ $sane_sanitizers['hash'] = function ($in, &$out, $i, $arg)
+   return $sane_sanitizers['preg'] ($in, $out, $i, '/^[a-f\d]+$/');
+ };
+ 
++$sane_sanitizers['path'] = function ($in,  &$out, $i, $arg)
++{
++  global $sane_sanitizers;
++  return $sane_sanitizers['preg'] ($in, $out, $i, ',^[:/[:alnum:]._-]+$,');
++};
++
++
+ # Only allow strings without quotes.
+ $sane_sanitizers['no_quotes'] = function ($in, &$out, $i, $arg)
+ {
+diff --git a/frontend/php/include/vcs.php b/frontend/php/include/vcs.php
+index c6e4e86..0bfb225 100644
+--- a/frontend/php/include/vcs.php
++++ b/frontend/php/include/vcs.php
+@@ -1,5 +1,5 @@
+ <?php
+-# Function to define a generic VCS index.php.
++# Generic VCS-related functions.
+ #
+ # Copyright (C) 1999, 2000 The SourceForge Crew
+ # Copyright (C) 2000-2006 Mathieu Roy <yeupou--gnu.org>
+@@ -41,114 +41,117 @@
+ # You should have received a copy of the GNU General Public License
+ # along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ 
+-function vcs_description_fallback (&$desc, $url)
++require_once (dirname (__FILE__) . '/vcs/git.php');
++
++function vcs_sorting_sequence ($vcs, $group_id)
+ {
+-  $default_description =
+-    "Unnamed repository; edit this file 'description' to name the repository.";
+-  if (empty ($desc) || $desc == $default_description)
+-    $desc = $url;
++  $pref = group_get_preference ($group_id, "vcs:$vcs:repo-order");
++  if (empty ($pref))
++    return [];
++  return explode (':', $pref);
+ }
+ 
+-function vcs_get_list_from_cgitrepos ($group_name)
++function vcs_save_sorting ($vcs, $group_id, &$repos)
+ {
+-  global $sys_etc_dir;
++  $order = [];
++  foreach ($repos as $r)
++    $order[] = $r['name'];
++  $order = join (':', $order);
++  group_set_preference ($group_id, "vcs:$vcs:repo-order", $order);
++}
+ 
+-  exec (
+-    "grep -A 3 '^repo\.url=$group_name\(/\|\.git$\)' $sys_etc_dir/cgitrepos",
+-    $output
+-  );
+-  $n = intval ((count ($output) + 1) / 5);
+-  $ret = [];
+-  for ($i = 0; $i < $n; $i++)
+-    {
+-      $ret[$i] = [
+-        'url' => preg_replace (':^repo[.]url=:', '', $output[$i * 5]),
+-        'path' => preg_replace (':repo.path=:', '', $output[$i * 5 + 1]),
+-        'desc' => preg_replace (':^repo[.]desc=:', '', $output[$i * 5 + 2])
+-      ];
+-      vcs_description_fallback ($ret[$i]['desc'], $ret[$i]['url']);
+-    }
+-  return $ret;
++function vcs_get_repo_pref ($vcs, $group_id, $pref, $repo)
++{
++  return group_get_preference ($group_id, "vcs:$vcs:$pref:$repo");
++}
++function vcs_set_repo_pref ($vcs, $group_id, $pref, $repo, $val)
++{
++  group_set_preference ($group_id, "vcs:$vcs:$pref:$repo", $val);
+ }
+ 
+-function vcs_make_git_entry ($git_dir, $repo_dir, $clone_path)
++function vcs_set_repo_description ($vcs, $group_id, $name, $description)
++{
++  vcs_set_repo_pref ($vcs, $group_id, "desc", $name, $description);
++}
++function vcs_get_repo_description ($vcs, $group_id, $name)
+ {
+-  $dir_name = "$git_dir/$repo_dir";
+-  if (!is_dir ($dir_name))
+-    return null;
+-  $desc = file_get_contents ("$dir_name/description");
+-  if ($desc === false)
+-    $desc = '';
+-  $desc = trim ($desc);
+-  vcs_description_fallback ($desc, $repo_dir);
+-  return
+-    ['url' => $repo_dir, 'desc' => $desc, 'path' => "$clone_path/$repo_dir"];
++  return vcs_get_repo_pref ($vcs, $group_id, "desc", $name);
+ }
+ 
+-function vcs_list_git_subdirs ($dir_name)
++function vcs_tarballs_disabled ($vcs, $group_id, $name)
+ {
+-  # We don't catch warnings when opening the directory: if the directory
+-  # isn't readable, the attributes need fixing in the filesystem.
+-  $dir_handle = opendir ($dir_name);
+-  if ($dir_handle === false)
+-    return null;
+-  $ret = [];
+-  while (($entry = readdir ($dir_handle)) !== false)
+-    if (preg_match ('/[.]git$/', $entry))
+-      $ret[] = $entry;
+-  closedir ($dir_handle);
+-  return $ret;
++  return vcs_get_repo_pref ($vcs, $group_id, "no-tarball", $name);
++}
++function vcs_disable_tarballs ($vcs, $group_id, $name, $val)
++{
++  vcs_set_repo_pref ($vcs, $group_id, "no-tarball", $name, $val);
+ }
+ 
+-function vcs_list_git_repos ($group_name, $git_dir, $clone_path)
++function vcs_set_repo_readme ($vcs, $group_id, $name, $description)
++{
++  vcs_set_repo_pref ($vcs, $group_id, "readme", $name, $description);
++}
++function vcs_get_repo_readme ($vcs, $group_id, $name)
++{
++  return vcs_get_repo_pref ($vcs, $group_id, "readme", $name);
++}
++
++# Use descriptions from database when available.
++function vcs_override_descriptions ($vcs, $group_id, $repos)
+ {
+   $ret = [];
+-  $entry = vcs_make_git_entry ($git_dir, "$group_name.git", $clone_path);
+-  if (!empty ($entry))
+-    $ret[] = $entry;
+-  $dir_name = "$git_dir/$group_name";
+-  if (!is_dir ($dir_name))
+-    return $ret;
+-  $dir_list = vcs_list_git_subdirs ($dir_name);
+-  foreach ($dir_list as $d)
++  foreach ($repos as $r)
+     {
+-      $entry = vcs_make_git_entry ($git_dir, "$group_name/$d", $clone_path);
+-      if (!empty ($entry))
+-        $ret[] = $entry;
++      $desc = vcs_get_repo_description ($vcs, $group_id, $r['name']);
++      if (!empty ($desc))
++        $r['desc'] = $desc;
++      $ret[] = $r;
+     }
+   return $ret;
+ }
+ 
+-function vcs_get_list_from_dirs ($group_name, $vcs)
++# Sort repos according to group preferences.
++function vcs_sort_repos ($vcs, $group_id, $repos)
+ {
+-  global $sys_vcs_dir;
+-  if ($vcs != 'git')
+-    return null;
+-  if (empty ($sys_vcs_dir) || !is_array ($sys_vcs_dir))
+-    return null;
+-  if (
+-    empty ($sys_vcs_dir['git']['dir']) || !is_dir ($sys_vcs_dir['git']['dir'])
+-  )
+-    return null;
+-  $git_dir = $sys_vcs_dir['git']['dir'];
+-  if (empty ($sys_vcs_dir['git']['clone-path']))
+-    $clone_path = $git_dir;
+-  else
+-    $clone_path = $sys_vcs_dir['git']['clone-path'];
+-  return vcs_list_git_repos ($group_name, $git_dir, $clone_path);
++  $seq = vcs_sorting_sequence ($vcs, $group_id);
++  if (empty ($seq))
++    return $repos;
++  $named = [];
++  foreach ($repos as $r)
++    $named[$r['name']] = $r;
++  $ret = [];
++  foreach ($seq as $r)
++    if (array_key_exists ($r, $named))
++      {
++        $ret[] = $named[$r];
++        unset ($named[$r]);
++      }
++  foreach ($named as $r)
++    $ret[] = $r;
++  return $ret;
+ }
+ 
+ # Get array of repository descriptions.
+-function vcs_get_repos ($vcs_exfix, $group_id)
++function vcs_get_repos ($vcs, $group_id)
+ {
+-  if ($vcs_exfix !== 'git')
++  global $sys_vcs_dir;
++  $func = "{$vcs}_list_repos";
++  if (!function_exists ($func))
+     return [];
+   $group = project_get_object ($group_id);
+   $group_name = $group->getUnixName ();
+-  $ret = vcs_get_list_from_dirs ($group_name, $vcs_exfix);
+-  if (empty ($ret))
+-    return vcs_get_list_from_cgitrepos ($group_name);
+-  return $ret;
++  if (empty ($sys_vcs_dir) || !is_array ($sys_vcs_dir))
++    return [];
++  if (empty ($sys_vcs_dir[$vcs]['dir']) || !is_dir ($sys_vcs_dir[$vcs]['dir']))
++    return [];
++  $vcs_dir = $sys_vcs_dir[$vcs]['dir'];
++  if (empty ($sys_vcs_dir[$vcs]['clone-path']))
++    $clone_path = $vcs_dir;
++  else
++    $clone_path = $sys_vcs_dir[$vcs]['clone-path'];
++  $repos = $func ($group_name, $vcs_dir, $clone_path);
++  $repos = vcs_override_descriptions ($vcs, $group_id, $repos);
++  return vcs_sort_repos ($vcs, $group_id, $repos);
+ }
+ 
+ function vcs_print_browsing_preface ($vcs_name)
+diff --git a/frontend/php/include/vcs/git.php b/frontend/php/include/vcs/git.php
+new file mode 100644
+index 0000000..9dc28dd
+--- /dev/null
++++ b/frontend/php/include/vcs/git.php
+@@ -0,0 +1,127 @@
++<?php
++# Git-specific functions.
++# To be included from php/include/vcs.php only.
++#
++# Copyright (C) 1999, 2000 The SourceForge Crew
++# Copyright (C) 2000-2006 Mathieu Roy <yeupou--gnu.org>
++# Copyright (C) 2014, 2016, 2017 Assaf Gordon
++# Copyright (C) 2001-2011, 2013, 2017 Sylvain Beucler
++# Copyright (C) 2013, 2014, 2017-2023 Ineiev
++#
++# This file is part of Savane.
++#
++# Code written before 2008-03-30 (commit 8b757b2565ff) is distributed
++# under the terms of the GNU General Public license version 3 or (at your
++# option) any later version; further contributions are covered by
++# the GNU Affero General Public license version 3 or (at your option)
++# any later version.  The license notices for the AGPL and the GPL follow.
++#
++# Savane is free software: you can redistribute it and/or modify
++# it under the terms of the GNU Affero General Public License as
++# published by the Free Software Foundation, either version 3 of the
++# License, or (at your option) any later version.
++#
++# Savane is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU Affero General Public License for more details.
++#
++# You should have received a copy of the GNU Affero General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++#
++# Savane is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as
++# published by the Free Software Foundation, either version 3 of the
++# License, or (at your option) any later version.
++#
++# Savane is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++function git_description_fallback (&$desc, $url)
++{
++  $default_description =
++    "Unnamed repository; edit this file 'description' to name the repository.";
++  if (empty ($desc) || $desc == $default_description)
++    $desc = $url;
++}
++
++function git_make_entry ($git_dir, $repo_dir, $clone_path)
++{
++  $dir_name = "$git_dir/$repo_dir";
++  if (!is_dir ($dir_name))
++    return null;
++  $desc = file_get_contents ("$dir_name/description");
++  if ($desc === false)
++    $desc = '';
++  $desc = trim ($desc);
++  git_description_fallback ($desc, $repo_dir);
++  $name = preg_replace ('/[.]git$/', "", $repo_dir);
++  return ['name' => $name, 'url' => $repo_dir, 'desc' => $desc,
++    'path' => "$clone_path/$repo_dir"
++  ];
++}
++
++function git_get_list_from_cgitrepos ($group_name)
++{
++  global $sys_etc_dir;
++
++  exec (
++    "grep -A 3 '^repo\.url=$group_name\(/\|\.git$\)' $sys_etc_dir/cgitrepos",
++    $output
++  );
++  $n = intval ((count ($output) + 1) / 5);
++  $ret = [];
++  for ($i = 0; $i < $n; $i++)
++    {
++      $ret[$i] = [
++        'url' => preg_replace (':^repo[.]url=:', '', $output[$i * 5]),
++        'path' => preg_replace (':repo[.]path=:', '', $output[$i * 5 + 1]),
++        'desc' => preg_replace (':^repo[.]desc=:', '', $output[$i * 5 + 2])
++      ];
++      $ret[$i]['name'] = preg_replace ('/[.]git/', "", $ret[$i]['url']);
++      git_description_fallback ($ret[$i]['desc'], $ret[$i]['url']);
++    }
++  return $ret;
++}
++
++function git_list_subdirs ($dir_name)
++{
++  # We don't catch warnings when opening the directory: if the directory
++  # isn't readable, the attributes need fixing in the filesystem.
++  $dir_handle = opendir ($dir_name);
++  if ($dir_handle === false)
++    return null;
++  $ret = [];
++  while (($entry = readdir ($dir_handle)) !== false)
++    if (preg_match ('/[.]git$/', $entry))
++      $ret[] = $entry;
++  closedir ($dir_handle);
++  return $ret;
++}
++
++function git_list_repos ($group_name, $git_dir, $clone_path)
++{
++  $ret = [];
++  $entry = git_make_entry ($git_dir, "$group_name.git", $clone_path);
++  if (!empty ($entry))
++    $ret[] = $entry;
++  $dir_name = "$git_dir/$group_name";
++  if (!is_dir ($dir_name))
++    return $ret;
++  $dir_list = git_list_subdirs ($dir_name);
++  foreach ($dir_list as $d)
++    {
++      $entry = git_make_entry ($git_dir, "$group_name/$d", $clone_path);
++      if (!empty ($entry))
++        $ret[] = $entry;
++    }
++  if (empty ($ret))
++    return git_get_list_from_cgitrepos ($group_name);
++  return $ret;
++}
++?>
+diff --git a/frontend/php/testing/sane.php b/frontend/php/testing/sane.php
+index 28d430b..a1716c6 100644
+--- a/frontend/php/testing/sane.php
++++ b/frontend/php/testing/sane.php
+@@ -460,6 +460,15 @@ $reference = 'forum/message.php';
+   test_sane_import ($in, $names, $out);
+ }
+ 
++$reference = 'git/admin/index.php';
++{
++  $names = ['path' => ['readme0', 'readme1', 'readme2', 'readme3']];
++  $in = ['readme2' => 'doc/read-me.md'];
++  $out = $in;
++  $out['readme0'] = $out['readme1'] = $out['readme3'] = null;
++  test_sane_import ($in, $names, $out);
++}
++
+ $reference = 'i18n.php';
+ {
+   $names = [
+generated by cgit v1.1 at 2023-
